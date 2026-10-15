@@ -1,10 +1,12 @@
 """
-Simulador de Tráfico - Fase 5 (Versión Responsiva Sin Colisiones)
-Novedades:
-- Soporte para cambio de tamaño de ventana (RESIZABLE) y pantalla completa.
-- Renderizado adaptativo mediante superficie virtual (mantiene aspect ratio).
-- Eliminación total de traslapes mediante Hitbox interactivo.
-- Prevención de bloqueos en cruce (Gridlock Prevention).
+Simulador de Tráfico - Fase 5 (Versión Unificada y Responsiva)
+=============================================================
+Características:
+- Diseño Responsivo: Escala dinámicamente al redimensionar la ventana o maximizar.
+- Navegación y Giros: Giros fluidos a la DERECHA, IZQUIERDA o FRENTE respetando carriles.
+- Luces Direccionales: Indicadores amarillos intermitentes según la intención de giro.
+- Prevención de Colisiones y Bloqueos (Gridlock): Detección por Hitbox y espera en cruce.
+- Control por Semáforos Sincronizados.
 
 Requisitos: pip install pygame
 """
@@ -14,10 +16,12 @@ import random
 import sys
 import pygame
 
-# Configuración virtual fija (Resolución lógica interna)
+# ──────────────────────────────────────────────
+# Configuración de Lienzo Virtual y Parámetros
+# ──────────────────────────────────────────────
 ANCHO_VIRTUAL, ALTO_VIRTUAL = 1000, 700
 FPS_OBJETIVO = 120
-TITULO = "Simulador de Tráfico - Fase 5 (Responsivo)"
+TITULO = "Simulador de Tráfico - Fase 5 (Unificado & Responsivo)"
 
 CENTRO_X, CENTRO_Y = ANCHO_VIRTUAL // 2, ALTO_VIRTUAL // 2
 ANCHO_CALLE = 180
@@ -28,15 +32,13 @@ X_DER = CENTRO_X + ANCHO_CALLE // 2
 Y_ARRIBA = CENTRO_Y - ANCHO_CALLE // 2
 Y_ABAJO = CENTRO_Y + ANCHO_CALLE // 2
 
-# Área delimitadora del centro del cruce
 CRUCE_RECT = pygame.Rect(X_IZQ, Y_ARRIBA, ANCHO_CALLE, ANCHO_CALLE)
 
+# Inicialización de Pygame
 pygame.init()
 pygame.display.set_caption(TITULO)
 
-# Ventana física inicial con bandera RESIZABLE
 PANTALLA_REAL = pygame.display.set_mode((ANCHO_VIRTUAL, ALTO_VIRTUAL), pygame.RESIZABLE | pygame.DOUBLEBUF)
-# Lienzo virtual donde se dibuja la lógica del juego
 CANVAS_VIRTUAL = pygame.Surface((ANCHO_VIRTUAL, ALTO_VIRTUAL))
 
 RELOJ = pygame.time.Clock()
@@ -44,7 +46,7 @@ FUENTE = pygame.font.SysFont("segoeui", 18)
 FUENTE_PEQUENA = pygame.font.SysFont("segoeui", 14)
 FUENTE_TITULO = pygame.font.SysFont("segoeui", 22, bold=True)
 
-# Paleta de colores
+# Paleta de Colores
 GRAMA = (33, 57, 48)
 CALLE = (53, 57, 62)
 BORDE = (115, 120, 123)
@@ -59,6 +61,9 @@ COLORES_H = [(65, 190, 245), (70, 220, 190), (95, 145, 255), (220, 225, 235)]
 COLORES_V = [(255, 155, 65), (245, 95, 105), (205, 125, 245), (245, 210, 85)]
 
 
+# ──────────────────────────────────────────────
+# Entidades Principales
+# ──────────────────────────────────────────────
 class Semaforo:
     def __init__(self, verde=10.0, amarillo=2.5):
         self.verde = verde
@@ -92,9 +97,10 @@ class Semaforo:
         ]
         for x, y, eje in posiciones:
             pygame.draw.rect(pantalla, (17, 19, 21), (x, y, 25, 62), border_radius=7)
-            luz = self.luz(eje)
+            luz_activa = self.luz(eje)
             for i, nombre in enumerate(("ROJO", "AMARILLO", "VERDE")):
-                color = {"ROJO": ROJO, "AMARILLO": AMARILLO, "VERDE": VERDE}[nombre] if luz == nombre else APAGADO
+                color = {"ROJO": ROJO, "AMARILLO": AMARILLO, "VERDE": VERDE}[
+                    nombre] if luz_activa == nombre else APAGADO
                 pygame.draw.circle(pantalla, color, (x + 12, y + 11 + i * 20), 7)
 
 
@@ -218,7 +224,7 @@ class Vehiculo:
         self.tick += dt
         self.velocidad = self.velocidad_base
 
-        # 1. Distancia de seguridad
+        # 1. Distancia de seguridad frontal
         dist_minima = 9999
         for otro in todos:
             if otro is self or otro.orientacion != self.orientacion:
@@ -239,7 +245,7 @@ class Vehiculo:
         if dist_minima < 50:
             self.velocidad = min(self.velocidad, max(0.0, (dist_minima - 12) * 3.5))
 
-        # 2. Detención semáforo / antibloqueo
+        # 2. Frenado por semáforo o bloqueo de intersección
         if self._debe_parar_por_semaforo(semaforo) or self._coche_bloqueando_cruce(todos):
             d = self._distancia_parada()
             if d <= 3:
@@ -251,7 +257,7 @@ class Vehiculo:
             self.velocidad = 0
             return
 
-        # 3. Movimiento y Hitbox futura
+        # 3. Proyección de movimiento y verificación de colisiones
         self._evaluar_giro()
         paso = self.velocidad * dt
 
@@ -289,6 +295,7 @@ class Vehiculo:
         pygame.draw.rect(pantalla, self.color, r, border_radius=6)
         pygame.draw.rect(pantalla, tuple(max(0, c - 35) for c in self.color), r, 2, border_radius=6)
 
+        # Parabrisas y luces principales
         if self.orientacion in ("DERECHA", "IZQUIERDA"):
             ventana = pygame.Rect(r.x + r.width * 0.30, r.y + 4, r.width * 0.38, r.height - 8)
             pygame.draw.rect(pantalla, (28, 43, 54), ventana, border_radius=4)
@@ -314,6 +321,7 @@ class Vehiculo:
                 pygame.draw.circle(pantalla, (255, 244, 190), (r.left + 5, r.top + 4), 2)
                 pygame.draw.circle(pantalla, (255, 244, 190), (r.right - 5, r.top + 4), 2)
 
+        # Luces direccionales intermitentes
         if not self.ha_girado and self.intencion != "FRENTE" and int(self.tick * 3.5) % 2 == 0:
             if self.orientacion == "DERECHA":
                 p = (r.right - 5, r.bottom - 4) if self.intencion == "DERECHA" else (r.right - 5, r.top + 4)
@@ -326,6 +334,9 @@ class Vehiculo:
             pygame.draw.circle(pantalla, AMARILLO, p, 3)
 
 
+# ──────────────────────────────────────────────
+# Controlador del Simulador
+# ──────────────────────────────────────────────
 class Simulador:
     def __init__(self):
         self.semaforo = Semaforo()
@@ -372,11 +383,13 @@ class Simulador:
             for y in range(18, ALTO_VIRTUAL, 85):
                 pygame.draw.circle(lienzo, (38, 64, 52), (x + (y % 17), y), 2)
 
+        # Estructura de calles
         pygame.draw.rect(lienzo, BORDE, (0, Y_ARRIBA - 4, ANCHO_VIRTUAL, ANCHO_CALLE + 8))
         pygame.draw.rect(lienzo, BORDE, (X_IZQ - 4, 0, ANCHO_CALLE + 8, ALTO_VIRTUAL))
         pygame.draw.rect(lienzo, CALLE, (0, Y_ARRIBA, ANCHO_VIRTUAL, ANCHO_CALLE))
         pygame.draw.rect(lienzo, CALLE, (X_IZQ, 0, ANCHO_CALLE, ALTO_VIRTUAL))
 
+        # Líneas divisorias
         for x in range(0, ANCHO_VIRTUAL, 38):
             if not X_IZQ - 5 <= x <= X_DER:
                 pygame.draw.line(lienzo, LINEA, (x, CENTRO_Y), (x + 20, CENTRO_Y), 2)
@@ -389,6 +402,7 @@ class Simulador:
         pygame.draw.line(lienzo, (90, 94, 98), (CENTRO_X - 1, 0), (CENTRO_X - 1, Y_ARRIBA), 1)
         pygame.draw.line(lienzo, (90, 94, 98), (CENTRO_X + 1, Y_ABAJO), (CENTRO_X + 1, ALTO_VIRTUAL), 1)
 
+        # Pasos peatonales
         for i in range(7):
             xx = X_IZQ + 8 + i * 23
             pygame.draw.rect(lienzo, (185, 187, 182), (xx, Y_ARRIBA - 19, 13, 13))
@@ -443,26 +457,25 @@ class Simulador:
             if not self.pausado:
                 self.actualizar(dt)
 
-            # 1. Dibujar todo el contenido en el lienzo virtual
+            # 1. Dibujar el contenido en el lienzo virtual
             self.dibujar_mapa(CANVAS_VIRTUAL)
             self.semaforo.dibujar(CANVAS_VIRTUAL)
             for vehiculo in self.vehiculos:
                 vehiculo.dibujar(CANVAS_VIRTUAL)
             self.dibujar_hud(CANVAS_VIRTUAL)
 
-            # 2. Calcular el escalado responsivo manteniendo el aspect ratio en la ventana real
+            # 2. Reescalado responsivo conservando el aspecto proporcional
             ancho_win, alto_win = PANTALLA_REAL.get_size()
             escala = min(ancho_win / ANCHO_VIRTUAL, alto_win / ALTO_VIRTUAL)
             ancho_escalado = int(ANCHO_VIRTUAL * escala)
             alto_escalado = int(ALTO_VIRTUAL * escala)
 
-            # Centrar el lienzo escalado en la pantalla
             off_x = (ancho_win - ancho_escalado) // 2
             off_y = (alto_win - alto_escalado) // 2
 
             canvas_escalado = pygame.transform.smoothscale(CANVAS_VIRTUAL, (ancho_escalado, alto_escalado))
 
-            PANTALLA_REAL.fill((10, 12, 14))  # Barras negras/fondo lateral
+            PANTALLA_REAL.fill((10, 12, 14))  # Fondo oscuro de relleno para las franjas
             PANTALLA_REAL.blit(canvas_escalado, (off_x, off_y))
 
             pygame.display.flip()
