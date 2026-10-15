@@ -15,7 +15,7 @@ import pygame
 # ──────────────────────────────────────────────
 # Configuración
 # ──────────────────────────────────────────────
-ANCHO, ALTO = 800, 600
+ANCHO, ALTO = 900, 600
 FPS = 60
 TITULO = "Simulador de Tráfico - Fase 4: Giros y Direccionales"
 
