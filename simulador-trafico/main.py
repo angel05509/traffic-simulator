@@ -1,12 +1,29 @@
 """
-Simulador de Tráfico - Fase 5 (Versión Unificada y Responsiva)
-=============================================================
-Características:
-- Diseño Responsivo: Escala dinámicamente al redimensionar la ventana o maximizar.
-- Navegación y Giros: Giros fluidos a la DERECHA, IZQUIERDA o FRENTE respetando carriles.
-- Luces Direccionales: Indicadores amarillos intermitentes según la intención de giro.
-- Prevención de Colisiones y Bloqueos (Gridlock): Detección por Hitbox y espera en cruce.
-- Control por Semáforos Sincronizados.
+Simulador de Tráfico - Fase 5 (Unificado, Responsivo y con Giros Fluidos)
+=========================================================================
+Fusión de las dos versiones de la Fase 5, con el motor de movimiento rehecho.
+
+Novedades principales
+- Giros fluidos: cada coche sigue una trayectoria curva (Bézier) por su carril
+  y el sprite rota de forma continua con la tangente de la curva. Se ve
+  cómo giran a la derecha, a la izquierda o siguen de frente.
+- Frenado suave antes del giro y aceleración progresiva al salir.
+- Cruce sin choques: reserva de intersección. Un coche solo entra si su
+  trayectoria no entra en conflicto con la de otro coche que ya cruza y si la
+  calle de salida tiene espacio (evita bloqueos / gridlock).
+  Quien lleva más tiempo esperando tiene prioridad (sin inanición).
+- Semáforo con fase de "todo rojo", decisión de amarillo realista y cuenta
+  regresiva.
+- Distancia de seguridad siguiendo la trayectoria (también dentro de curvas).
+- Luces direccionales y luces de freno.
+- Diseño responsivo: el lienzo virtual se escala al redimensionar o maximizar.
+- Movimiento con delta time y subpasos (estable a cualquier FPS).
+
+Controles
+  ESPACIO  pausar / reanudar         R      reiniciar tráfico
+  T        ver trayectorias de giro  E      ver estelas de los giros
+  ↑ / ↓    más / menos tráfico       + / -  velocidad de simulación (cámara lenta)
+  F11      pantalla completa         ESC    salir
 
 Requisitos: pip install pygame
 """
@@ -14,27 +31,38 @@ Requisitos: pip install pygame
 import math
 import random
 import sys
+from bisect import bisect_right
+from collections import deque
+
 import pygame
 
 # ──────────────────────────────────────────────
-# Configuración de Lienzo Virtual y Parámetros
+# Configuración de lienzo virtual y geometría
 # ──────────────────────────────────────────────
 ANCHO_VIRTUAL, ALTO_VIRTUAL = 1000, 700
 FPS_OBJETIVO = 120
-TITULO = "Simulador de Tráfico - Fase 5 (Unificado & Responsivo)"
+TITULO = "Simulador de Tráfico - Fase 5 (Unificado, Responsivo y Giros Fluidos)"
 
 CENTRO_X, CENTRO_Y = ANCHO_VIRTUAL // 2, ALTO_VIRTUAL // 2
 ANCHO_CALLE = 180
+MITAD = ANCHO_CALLE // 2
+CARRIL = 43            # distancia del centro de la calle al centro de cada carril
+DIST_PARADA = 26       # distancia de la línea de alto al borde de la intersección
+MARGEN_FUERA = 70      # los coches nacen / mueren a esta distancia fuera de pantalla
 
-# Coordenadas clave de la intersección
-X_IZQ = CENTRO_X - ANCHO_CALLE // 2
-X_DER = CENTRO_X + ANCHO_CALLE // 2
-Y_ARRIBA = CENTRO_Y - ANCHO_CALLE // 2
-Y_ABAJO = CENTRO_Y + ANCHO_CALLE // 2
+X_IZQ = CENTRO_X - MITAD
+X_DER = CENTRO_X + MITAD
+Y_ARRIBA = CENTRO_Y - MITAD
+Y_ABAJO = CENTRO_Y + MITAD
 
-CRUCE_RECT = pygame.Rect(X_IZQ, Y_ARRIBA, ANCHO_CALLE, ANCHO_CALLE)
+LARGO, ANCHO = 42, 23  # tamaño del coche
 
-# Inicialización de Pygame
+# Física (px/s y px/s²)
+A_ACEL = 160.0
+A_COMODO = 190.0       # frenado "de planificación"
+A_FRENO = 340.0        # frenado máximo real (siempre mayor que A_COMODO)
+UMBRAL_CONFLICTO = 40.0
+
 pygame.init()
 pygame.display.set_caption(TITULO)
 
@@ -42,11 +70,12 @@ PANTALLA_REAL = pygame.display.set_mode((ANCHO_VIRTUAL, ALTO_VIRTUAL), pygame.RE
 CANVAS_VIRTUAL = pygame.Surface((ANCHO_VIRTUAL, ALTO_VIRTUAL))
 
 RELOJ = pygame.time.Clock()
-FUENTE = pygame.font.SysFont("segoeui", 18)
-FUENTE_PEQUENA = pygame.font.SysFont("segoeui", 14)
-FUENTE_TITULO = pygame.font.SysFont("segoeui", 22, bold=True)
+_FAMILIA = "segoeui,arial,dejavusans,helvetica"
+FUENTE = pygame.font.SysFont(_FAMILIA, 18)
+FUENTE_PEQUENA = pygame.font.SysFont(_FAMILIA, 14)
+FUENTE_TITULO = pygame.font.SysFont(_FAMILIA, 22, bold=True)
 
-# Paleta de Colores
+# Paleta
 GRAMA = (33, 57, 48)
 CALLE = (53, 57, 62)
 BORDE = (115, 120, 123)
@@ -60,283 +89,429 @@ APAGADO = (62, 65, 67)
 COLORES_H = [(65, 190, 245), (70, 220, 190), (95, 145, 255), (220, 225, 235)]
 COLORES_V = [(255, 155, 65), (245, 95, 105), (205, 125, 245), (245, 210, 85)]
 
+COLOR_GIRO = {"FRENTE": (120, 170, 230), "DERECHA": (90, 230, 150), "IZQUIERDA": (255, 190, 80)}
 
 # ──────────────────────────────────────────────
-# Entidades Principales
+# Rutas: cada combinación (origen, giro) es una trayectoria
+# ──────────────────────────────────────────────
+ORIGENES = ("OESTE", "ESTE", "NORTE", "SUR")
+GIROS = ("FRENTE", "DERECHA", "IZQUIERDA")
+# Dirección de avance (pantalla: y crece hacia abajo). Tráfico por la derecha.
+DIRS = {"OESTE": (1, 0), "ESTE": (-1, 0), "NORTE": (0, 1), "SUR": (0, -1)}
+
+
+def girar(d, giro):
+    dx, dy = d
+    if giro == "DERECHA":
+        return (-dy, dx)
+    if giro == "IZQUIERDA":
+        return (dy, -dx)
+    return d
+
+
+class Ruta:
+    """Trayectoria completa (entrada → cruce → salida) como polilínea con longitud acumulada."""
+
+    PASOS_CURVA = 40
+
+    def __init__(self, origen, giro):
+        self.origen, self.giro = origen, giro
+        d = DIRS[origen]
+        d2 = girar(d, giro)
+        self.dir_entrada, self.dir_salida = d, d2
+        self.eje = "H" if d[0] != 0 else "V"
+
+        rv = (-d[1], d[0])       # "derecha" del conductor
+        rv2 = (-d2[1], d2[0])
+        ext = ANCHO_VIRTUAL // 2 if d[0] != 0 else ALTO_VIRTUAL // 2
+        ext2 = ANCHO_VIRTUAL // 2 if d2[0] != 0 else ALTO_VIRTUAL // 2
+
+        inicio = (CENTRO_X + rv[0] * CARRIL - d[0] * (ext + MARGEN_FUERA),
+                  CENTRO_Y + rv[1] * CARRIL - d[1] * (ext + MARGEN_FUERA))
+        p_in = (CENTRO_X + rv[0] * CARRIL - d[0] * MITAD,
+                CENTRO_Y + rv[1] * CARRIL - d[1] * MITAD)
+        p_out = (CENTRO_X + rv2[0] * CARRIL + d2[0] * MITAD,
+                 CENTRO_Y + rv2[1] * CARRIL + d2[1] * MITAD)
+        fin = (CENTRO_X + rv2[0] * CARRIL + d2[0] * (ext2 + MARGEN_FUERA),
+               CENTRO_Y + rv2[1] * CARRIL + d2[1] * (ext2 + MARGEN_FUERA))
+
+        pts = [inicio, p_in]
+        if giro != "FRENTE":
+            # Bézier cuadrática: el punto de control es la esquina donde se cortan
+            # la recta de entrada y la recta de salida.
+            c = (p_out[0], p_in[1]) if d[0] != 0 else (p_in[0], p_out[1])
+            n = self.PASOS_CURVA
+            for i in range(1, n):
+                t = i / n
+                u = 1 - t
+                pts.append((u * u * p_in[0] + 2 * u * t * c[0] + t * t * p_out[0],
+                            u * u * p_in[1] + 2 * u * t * c[1] + t * t * p_out[1]))
+        pts += [p_out, fin]
+
+        self.pts = pts
+        self.acum = [0.0]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            self.acum.append(self.acum[-1] + math.hypot(x1 - x0, y1 - y0))
+        self.largo = self.acum[-1]
+        self.s_linea = self.acum[1]            # borde de la intersección
+        self.s_parada = self.s_linea - DIST_PARADA
+        self.s_salida = self.acum[-2]          # fin de la curva
+        self.s_fin_cruce = self.s_salida + 40  # a partir de aquí ya "liberó" el cruce
+        self.p_salida = p_out
+
+    def punto(self, s):
+        s = 0.0 if s < 0 else self.largo if s > self.largo else s
+        i = bisect_right(self.acum, s) - 1
+        i = min(max(i, 0), len(self.pts) - 2)
+        seg = self.acum[i + 1] - self.acum[i]
+        t = (s - self.acum[i]) / seg if seg > 0 else 0.0
+        x0, y0 = self.pts[i]
+        x1, y1 = self.pts[i + 1]
+        return x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+
+    def muestra(self, s):
+        """Posición y dirección unitaria (tangente suavizada) en la distancia s."""
+        x, y = self.punto(s)
+        xa, ya = self.punto(s + 7)
+        xb, yb = self.punto(s - 7)
+        hx, hy = xa - xb, ya - yb
+        n = math.hypot(hx, hy)
+        if n < 1e-6:
+            return x, y, float(self.dir_entrada[0]), float(self.dir_entrada[1])
+        return x, y, hx / n, hy / n
+
+
+RUTAS = {(o, g): Ruta(o, g) for o in ORIGENES for g in GIROS}
+
+_CONFLICTOS = {}
+
+
+def en_conflicto(ra, rb):
+    """True si las trayectorias dentro del cruce se acercan lo suficiente como para chocar."""
+    clave = (ra.origen, ra.giro, rb.origen, rb.giro)
+    res = _CONFLICTOS.get(clave)
+    if res is None:
+        def muestras(r):
+            lst, s = [], r.s_linea - 10
+            while s <= r.s_salida + 30:
+                lst.append(r.punto(s))
+                s += 6
+            return lst
+        a, b = muestras(ra), muestras(rb)
+        u2 = UMBRAL_CONFLICTO ** 2
+        res = any((ax - bx) ** 2 + (ay - by) ** 2 < u2 for ax, ay in a for bx, by in b)
+        _CONFLICTOS[clave] = res
+    return res
+
+
+# ──────────────────────────────────────────────
+# Sprites de coche (se dibujan una vez y se rotan con caché)
+# ──────────────────────────────────────────────
+_BASES = {}
+_ROTADOS = {}
+
+
+def _construir_base(color):
+    S = 3
+    w, h = LARGO * S, ANCHO * S
+    base = pygame.Surface((w, h), pygame.SRCALPHA)
+    oscuro = tuple(max(0, c - 45) for c in color)
+    claro = tuple(min(255, c + 28) for c in color)
+    pygame.draw.rect(base, oscuro, (0, 0, w, h), border_radius=16)
+    pygame.draw.rect(base, color, (3, 3, w - 6, h - 6), border_radius=14)
+    pygame.draw.rect(base, (28, 43, 54), (int(w * 0.60), 8, int(w * 0.15), h - 16), border_radius=7)
+    pygame.draw.rect(base, (28, 43, 54), (int(w * 0.20), 9, int(w * 0.12), h - 18), border_radius=6)
+    pygame.draw.rect(base, claro, (int(w * 0.33), 8, int(w * 0.26), h - 16), border_radius=6)
+    pygame.draw.line(base, (112, 145, 158), (int(w * 0.62), 14), (int(w * 0.72), h - 14), 2)
+    for yy in (0.2, 0.8):
+        pygame.draw.ellipse(base, (255, 244, 190), (int(w * 0.92), int(h * yy) - 6, 14, 12))
+        pygame.draw.ellipse(base, (150, 25, 30), (int(w * 0.03), int(h * yy) - 6, 12, 12))
+    cuerpo = pygame.transform.smoothscale(base, (LARGO, ANCHO))
+    sombra = pygame.Surface((LARGO, ANCHO), pygame.SRCALPHA)
+    pygame.draw.rect(sombra, (0, 0, 0, 95), (0, 0, LARGO, ANCHO), border_radius=6)
+    return cuerpo, sombra
+
+
+def sprite_coche(color, grados):
+    clave = (color, grados)
+    par = _ROTADOS.get(clave)
+    if par is None:
+        base = _BASES.get(color)
+        if base is None:
+            base = _BASES[color] = _construir_base(color)
+        par = _ROTADOS[clave] = (pygame.transform.rotate(base[0], grados),
+                                 pygame.transform.rotate(base[1], grados))
+    return par
+
+
+# ──────────────────────────────────────────────
+# Semáforo
 # ──────────────────────────────────────────────
 class Semaforo:
-    def __init__(self, verde=10.0, amarillo=2.5):
-        self.verde = verde
-        self.amarillo = amarillo
+    ORDEN = ["H_VERDE", "H_AMARILLO", "H_TODO_ROJO", "V_VERDE", "V_AMARILLO", "V_TODO_ROJO"]
+
+    def __init__(self, verde=10.0, amarillo=2.5, todo_rojo=1.2):
+        self.verde, self.amarillo, self.todo_rojo = verde, amarillo, todo_rojo
         self.estado = "H_VERDE"
         self.t = 0.0
 
+    def _duracion(self):
+        if self.estado.endswith("VERDE"):
+            return self.verde
+        if self.estado.endswith("AMARILLO"):
+            return self.amarillo
+        return self.todo_rojo
+
     def actualizar(self, dt):
         self.t += dt
-        limite = self.verde if "VERDE" in self.estado else self.amarillo
-        if self.t >= limite:
-            self.t = 0.0
-            self.estado = {
-                "H_VERDE": "H_AMARILLO",
-                "H_AMARILLO": "V_VERDE",
-                "V_VERDE": "V_AMARILLO",
-                "V_AMARILLO": "H_VERDE",
-            }[self.estado]
+        while self.t >= self._duracion():
+            self.t -= self._duracion()
+            self.estado = self.ORDEN[(self.ORDEN.index(self.estado) + 1) % len(self.ORDEN)]
+
+    def restante(self):
+        return max(0.0, self._duracion() - self.t)
 
     def luz(self, eje):
-        if eje == "H":
-            return "VERDE" if self.estado == "H_VERDE" else "AMARILLO" if self.estado == "H_AMARILLO" else "ROJO"
-        return "VERDE" if self.estado == "V_VERDE" else "AMARILLO" if self.estado == "V_AMARILLO" else "ROJO"
+        if self.estado.startswith(eje + "_"):
+            if self.estado.endswith("VERDE"):
+                return "VERDE"
+            if self.estado.endswith("AMARILLO"):
+                return "AMARILLO"
+        return "ROJO"
+
+    def texto(self):
+        nombres = {"H_VERDE": "H VERDE", "H_AMARILLO": "H AMARILLO", "V_VERDE": "V VERDE",
+                   "V_AMARILLO": "V AMARILLO", "H_TODO_ROJO": "TODO ROJO", "V_TODO_ROJO": "TODO ROJO"}
+        return f"{nombres[self.estado]} {self.restante():.0f}s"
 
     def dibujar(self, pantalla):
+        # Cada caja está a la derecha de su aproximación, antes de la línea de alto.
         posiciones = [
-            (X_IZQ - 42, Y_ARRIBA - 57, "H"),
-            (X_DER + 18, Y_ARRIBA - 57, "V"),
-            (X_IZQ - 42, Y_ABAJO + 8, "V"),
-            (X_DER + 18, Y_ABAJO + 8, "H"),
+            (X_IZQ - 42, Y_ABAJO + 8, "H"),    # viene del oeste (→)
+            (X_DER + 18, Y_ARRIBA - 57, "H"),  # viene del este (←)
+            (X_IZQ - 42, Y_ARRIBA - 57, "V"),  # viene del norte (↓)
+            (X_DER + 18, Y_ABAJO + 8, "V"),    # viene del sur (↑)
         ]
+        colores = {"ROJO": ROJO, "AMARILLO": AMARILLO, "VERDE": VERDE}
         for x, y, eje in posiciones:
             pygame.draw.rect(pantalla, (17, 19, 21), (x, y, 25, 62), border_radius=7)
-            luz_activa = self.luz(eje)
+            activa = self.luz(eje)
             for i, nombre in enumerate(("ROJO", "AMARILLO", "VERDE")):
-                color = {"ROJO": ROJO, "AMARILLO": AMARILLO, "VERDE": VERDE}[
-                    nombre] if luz_activa == nombre else APAGADO
-                pygame.draw.circle(pantalla, color, (x + 12, y + 11 + i * 20), 7)
+                cx, cy = x + 12, y + 11 + i * 20
+                if activa == nombre:
+                    c = colores[nombre]
+                    pygame.draw.circle(pantalla, tuple(int(v * 0.35 + 17 * 0.65) for v in c), (cx, cy), 10)
+                    pygame.draw.circle(pantalla, c, (cx, cy), 7)
+                else:
+                    pygame.draw.circle(pantalla, APAGADO, (cx, cy), 7)
 
 
+# ──────────────────────────────────────────────
+# Vehículo
+# ──────────────────────────────────────────────
 class Vehiculo:
-    LARGO = 42
-    ANCHO = 23
+    _contador = 0
 
-    def __init__(self, origen, posicion=None):
+    def __init__(self, origen, s=0.0):
+        Vehiculo._contador += 1
+        self.id = Vehiculo._contador
         self.origen = origen
-        self.orientacion = origen
-        self.velocidad_base = random.uniform(110, 145)
-        self.velocidad = self.velocidad_base
-        self.color = random.choice(COLORES_H if origen in ("DERECHA", "IZQUIERDA") else COLORES_V)
-        self.intencion = random.choices(["FRENTE", "DERECHA", "IZQUIERDA"], [0.60, 0.20, 0.20])[0]
-        self.ha_girado = False
+        self.giro = random.choices(GIROS, [0.60, 0.20, 0.20])[0]
+        self.ruta = RUTAS[(origen, self.giro)]
+        self.s = s
+        self.v_crucero = random.uniform(105, 140)
+        self.v_giro = random.uniform(60, 78)
+        self.vel = self.v_crucero
+        paleta = COLORES_H if self.ruta.eje == "H" else COLORES_V
+        self.color = random.choice(paleta)
+        self.autorizado = False     # ya reservó su paso por el cruce
+        self.cruzo = False          # ya liberó el cruce
+        self.t_espera = 0.0
+        self.frenando = False
         self.tick = random.random() * 2
-        self.rect = pygame.Rect(0, 0, self.LARGO, self.ANCHO)
-        self._poner_en_origen(posicion)
+        self.estela = deque(maxlen=45)
+        self._cuenta = 0
+        self._ult_estela = None
+        self._pose()
 
-    def _poner_en_origen(self, posicion=None):
-        if self.origen == "DERECHA":    # De oeste a este
-            self.orientacion = "DERECHA"
-            self.rect.size = (self.LARGO, self.ANCHO)
-            self.rect.left = -self.LARGO - 10 if posicion is None else posicion
-            self.rect.centery = CENTRO_Y + 43
-        elif self.origen == "IZQUIERDA":  # De este a oeste
-            self.orientacion = "IZQUIERDA"
-            self.rect.size = (self.LARGO, self.ANCHO)
-            self.rect.left = ANCHO_VIRTUAL + 10 if posicion is None else posicion
-            self.rect.centery = CENTRO_Y - 43
-        elif self.origen == "ABAJO":     # De norte a sur
-            self.orientacion = "ABAJO"
-            self.rect.size = (self.ANCHO, self.LARGO)
-            self.rect.centerx = CENTRO_X - 43
-            self.rect.top = -self.LARGO - 10 if posicion is None else posicion
-        else:                            # De sur a norte
-            self.orientacion = "ARRIBA"
-            self.rect.size = (self.ANCHO, self.LARGO)
-            self.rect.centerx = CENTRO_X + 43
-            self.rect.top = ALTO_VIRTUAL + 10 if posicion is None else posicion
+    # --- geometría ---------------------------------------------------------
+    def _pose(self):
+        self.x, self.y, self.hx, self.hy = self.ruta.muestra(self.s)
 
-    def _eje(self):
-        return "H" if self.orientacion in ("DERECHA", "IZQUIERDA") else "V"
-
-    def _distancia_parada(self):
-        if self.orientacion == "DERECHA":
-            return X_IZQ - self.rect.right
-        if self.orientacion == "IZQUIERDA":
-            return self.rect.left - X_DER
-        if self.orientacion == "ABAJO":
-            return Y_ARRIBA - self.rect.bottom
-        return self.rect.top - Y_ABAJO
-
-    def _debe_parar_por_semaforo(self, semaforo):
-        if self.ha_girado or CRUCE_RECT.colliderect(self.rect):
-            return False
-
-        luz = semaforo.luz(self._eje())
-        d = self._distancia_parada()
-
-        if luz in ("ROJO", "AMARILLO") and -5 <= d <= 95:
-            return True
-        return False
-
-    def _coche_bloqueando_cruce(self, todos):
-        if CRUCE_RECT.colliderect(self.rect) or self.ha_girado:
-            return False
-
-        d = self._distancia_parada()
-        if d > 35 or d < -10:
-            return False
-
-        for otro in todos:
-            if otro is self:
+    # --- percepción --------------------------------------------------------
+    def _buscar_lider(self, sim):
+        """Coche más cercano por delante, siguiendo la trayectoria propia (también en curva)."""
+        r = self.ruta
+        muestras = []
+        for k in range(16, 126, 10):
+            qx, qy = r.punto(self.s + k)
+            muestras.append((k, qx, qy))
+        mejor = None
+        for o in sim.vehiculos:
+            if o is self:
                 continue
-            if CRUCE_RECT.colliderect(otro.rect):
-                if otro._eje() != self._eje():
-                    return True
-                if otro.velocidad < 20:
-                    return True
+            dx, dy = o.x - self.x, o.y - self.y
+            if dx * dx + dy * dy > 170 * 170:
+                continue
+            if o.hx * self.hx + o.hy * self.hy < 0.35:   # solo quien va en sentido parecido
+                continue
+            for k, qx, qy in muestras:
+                ex, ey = o.x - qx, o.y - qy
+                if ex * ex + ey * ey < 22 * 22:
+                    gap = k + ex * self.hx + ey * self.hy - LARGO
+                    if mejor is None or gap < mejor[0]:
+                        mejor = (gap, o)
+                    break
+        return mejor
+
+    def _salida_bloqueada(self, sim):
+        """¿Hay un coche detenido / muy lento justo donde yo saldría del cruce?"""
+        px, py = self.ruta.p_salida
+        d2x, d2y = self.ruta.dir_salida
+        for o in sim.vehiculos:
+            if o is self:
+                continue
+            rx, ry = o.x - px, o.y - py
+            f = rx * d2x + ry * d2y
+            lat = abs(-rx * d2y + ry * d2x)
+            if -10 < f < 95 and lat < 26 and o.vel < 30:
+                return True
         return False
 
-    def _cambiar(self, orientacion, centerx, centery):
-        self.orientacion = orientacion
-        if orientacion in ("DERECHA", "IZQUIERDA"):
-            self.rect.size = (self.LARGO, self.ANCHO)
-        else:
-            self.rect.size = (self.ANCHO, self.LARGO)
-        self.rect.center = (centerx, centery)
-        self.ha_girado = True
+    def _evaluar_paso(self, sim, gap, dt):
+        r = self.ruta
+        luz = sim.semaforo.luz(r.eje)
+        if luz == "ROJO":
+            self.t_espera = 0.0
+            return False
+        if luz == "AMARILLO" and self.vel ** 2 / (2 * A_COMODO) <= max(0.0, gap):
+            self.t_espera = 0.0          # puede detenerse con comodidad: se detiene
+            return False
+        # solo el primero de la fila reserva el cruce
+        for o in sim.vehiculos:
+            if o is not self and o.origen == self.origen and not o.autorizado and o.s > self.s:
+                return False
+        bloqueado = self._salida_bloqueada(sim)
+        if not bloqueado:
+            for o in sim.vehiculos:
+                if o is self or o.origen == self.origen:
+                    continue
+                if o.autorizado and not o.cruzo:
+                    if en_conflicto(r, o.ruta):
+                        bloqueado = True
+                        break
+                elif not o.autorizado and o.t_espera > self.t_espera + 0.05:
+                    # alguien con conflicto lleva más tiempo esperando: tiene prioridad
+                    if en_conflicto(r, o.ruta):
+                        bloqueado = True
+                        break
+        if bloqueado:
+            self.t_espera += dt
+            return False
+        return True
 
-    def _evaluar_giro(self):
-        if self.ha_girado or self.intencion == "FRENTE":
-            return
-
-        if self.orientacion == "DERECHA" and self.rect.centerx >= CENTRO_X - 10:
-            if self.intencion == "DERECHA":
-                self._cambiar("ABAJO", CENTRO_X - 43, Y_ABAJO + 25)
-            else:
-                self._cambiar("ARRIBA", CENTRO_X + 43, Y_ARRIBA - 25)
-
-        elif self.orientacion == "IZQUIERDA" and self.rect.centerx <= CENTRO_X + 10:
-            if self.intencion == "DERECHA":
-                self._cambiar("ARRIBA", CENTRO_X + 43, Y_ARRIBA - 25)
-            else:
-                self._cambiar("ABAJO", CENTRO_X - 43, Y_ABAJO + 25)
-
-        elif self.orientacion == "ABAJO" and self.rect.centery >= CENTRO_Y - 10:
-            if self.intencion == "DERECHA":
-                self._cambiar("IZQUIERDA", X_IZQ - 25, CENTRO_Y - 43)
-            else:
-                self._cambiar("DERECHA", X_DER + 25, CENTRO_Y + 43)
-
-        elif self.orientacion == "ARRIBA" and self.rect.centery <= CENTRO_Y + 10:
-            if self.intencion == "DERECHA":
-                self._cambiar("DERECHA", X_DER + 25, CENTRO_Y + 43)
-            else:
-                self._cambiar("IZQUIERDA", X_IZQ - 25, CENTRO_Y - 43)
-
-    def actualizar(self, dt, semaforo, todos):
+    # --- dinámica ----------------------------------------------------------
+    def actualizar(self, dt, sim):
+        r = self.ruta
         self.tick += dt
-        self.velocidad = self.velocidad_base
+        objetivo = self.v_crucero
 
-        # 1. Distancia de seguridad frontal
-        dist_minima = 9999
-        for otro in todos:
-            if otro is self or otro.orientacion != self.orientacion:
-                continue
-            gap = 9999
-            if self.orientacion == "DERECHA" and abs(otro.rect.centery - self.rect.centery) < 20 and otro.rect.left >= self.rect.right:
-                gap = otro.rect.left - self.rect.right
-            elif self.orientacion == "IZQUIERDA" and abs(otro.rect.centery - self.rect.centery) < 20 and otro.rect.right <= self.rect.left:
-                gap = self.rect.left - otro.rect.right
-            elif self.orientacion == "ABAJO" and abs(otro.rect.centerx - self.rect.centerx) < 20 and otro.rect.top >= self.rect.bottom:
-                gap = otro.rect.top - self.rect.bottom
-            elif self.orientacion == "ARRIBA" and abs(otro.rect.centerx - self.rect.centerx) < 20 and otro.rect.bottom <= self.rect.top:
-                gap = self.rect.top - otro.rect.bottom
+        # 1. Reducir velocidad ANTES del giro y mantenerla durante la curva
+        if self.giro != "FRENTE" and self.s < r.s_salida:
+            d = max(0.0, r.s_linea - self.s)
+            objetivo = min(objetivo, math.sqrt(self.v_giro ** 2 + 2 * A_COMODO * d))
 
-            if gap < dist_minima:
-                dist_minima = gap
-
-        if dist_minima < 50:
-            self.velocidad = min(self.velocidad, max(0.0, (dist_minima - 12) * 3.5))
-
-        # 2. Frenado por semáforo o bloqueo de intersección
-        if self._debe_parar_por_semaforo(semaforo) or self._coche_bloqueando_cruce(todos):
-            d = self._distancia_parada()
-            if d <= 3:
-                self.velocidad = 0
+        # 2. Línea de alto: semáforo + reserva del cruce
+        if not self.autorizado:
+            gap = r.s_parada - 3 - LARGO / 2 - self.s
+            if gap < -8:
+                self.autorizado = True       # ya pasó la línea (no debería ocurrir)
             else:
-                self.velocidad = min(self.velocidad, max(0.0, d * 3.0))
+                umbral = max(45.0, self.vel ** 2 / (2 * A_COMODO) + 30)
+                if gap < umbral and self._evaluar_paso(sim, gap, dt):
+                    self.autorizado = True
+                    self.t_espera = 0.0
+                if not self.autorizado:
+                    objetivo = 0.0 if gap < 0.5 else min(objetivo, math.sqrt(2 * A_COMODO * gap))
 
-        if self.velocidad <= 0.1:
-            self.velocidad = 0
-            return
+        # 3. Distancia de seguridad con el coche de adelante
+        lider = self._buscar_lider(sim)
+        if lider:
+            gap, o = lider
+            v_perm = math.sqrt(o.vel ** 2 + 2 * A_COMODO * max(0.0, gap - 10))
+            if gap < 4:
+                v_perm = min(v_perm, o.vel * 0.5)
+            objetivo = min(objetivo, v_perm)
 
-        # 3. Proyección de movimiento y verificación de colisiones
-        self._evaluar_giro()
-        paso = self.velocidad * dt
+        # 4. Aceleración / frenado progresivos
+        if objetivo < self.vel:
+            self.vel = max(objetivo, self.vel - A_FRENO * dt)
+            self.frenando = True
+        else:
+            self.vel = min(objetivo, self.vel + A_ACEL * dt)
+            self.frenando = self.vel < 4
+        if self.vel < 0.5 and objetivo == 0.0:
+            self.vel = 0.0
 
-        futuro_rect = self.rect.copy()
-        if self.orientacion == "DERECHA":
-            futuro_rect.x += math.ceil(paso) + 3
-        elif self.orientacion == "IZQUIERDA":
-            futuro_rect.x -= math.ceil(paso) + 3
-        elif self.orientacion == "ABAJO":
-            futuro_rect.y += math.ceil(paso) + 3
-        elif self.orientacion == "ARRIBA":
-            futuro_rect.y -= math.ceil(paso) + 3
+        # 5. Avanzar sobre la trayectoria
+        self.s += self.vel * dt
+        self._pose()
 
-        for otro in todos:
-            if otro is not self and futuro_rect.colliderect(otro.rect):
-                self.velocidad = 0
-                return
+        if self.autorizado and not self.cruzo and self.s > r.s_fin_cruce:
+            self.cruzo = True
+            sim.pasados += 1
 
-        if self.orientacion == "DERECHA":
-            self.rect.x += paso
-        elif self.orientacion == "IZQUIERDA":
-            self.rect.x -= paso
-        elif self.orientacion == "ABAJO":
-            self.rect.y += paso
-        elif self.orientacion == "ARRIBA":
-            self.rect.y -= paso
+        # 6. Estela del giro (visual)
+        self._cuenta += 1
+        if self.giro != "FRENTE" and r.s_linea - 25 <= self.s <= r.s_salida + 35:
+            u = self._ult_estela
+            if u is None or (self.x - u[0]) ** 2 + (self.y - u[1]) ** 2 > 9:
+                self.estela.append((self.x, self.y))
+                self._ult_estela = (self.x, self.y)
+        elif self.estela and self._cuenta % 2 == 0:
+            self.estela.popleft()
 
     def fuera_pantalla(self):
-        return (self.rect.left > ANCHO_VIRTUAL + 80 or self.rect.right < -80 or
-                self.rect.top > ALTO_VIRTUAL + 80 or self.rect.bottom < -80)
+        return self.s >= self.ruta.largo
 
-    def dibujar(self, pantalla):
-        r = self.rect
-        pygame.draw.rect(pantalla, (15, 17, 19), r.move(2, 4), border_radius=6)
-        pygame.draw.rect(pantalla, self.color, r, border_radius=6)
-        pygame.draw.rect(pantalla, tuple(max(0, c - 35) for c in self.color), r, 2, border_radius=6)
+    # --- dibujo ------------------------------------------------------------
+    def _grados(self):
+        deg = -math.degrees(math.atan2(self.hy, self.hx))
+        return int(round(deg / 3.0)) * 3 % 360
 
-        # Parabrisas y luces principales
-        if self.orientacion in ("DERECHA", "IZQUIERDA"):
-            ventana = pygame.Rect(r.x + r.width * 0.30, r.y + 4, r.width * 0.38, r.height - 8)
-            pygame.draw.rect(pantalla, (28, 43, 54), ventana, border_radius=4)
-            pygame.draw.line(pantalla, (112, 145, 158), (ventana.x + 4, ventana.y + 2),
-                             (ventana.right - 4, ventana.bottom - 2), 1)
-            if self.orientacion == "DERECHA":
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.right - 4, r.top + 5), 2)
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.right - 4, r.bottom - 5), 2)
-                pygame.draw.circle(pantalla, (255, 55, 55), (r.left + 3, r.top + 5), 2)
-                pygame.draw.circle(pantalla, (255, 55, 55), (r.left + 3, r.bottom - 5), 2)
-            else:
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.left + 4, r.top + 5), 2)
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.left + 4, r.bottom - 5), 2)
-                pygame.draw.circle(pantalla, (255, 55, 55), (r.right - 3, r.top + 5), 2)
-                pygame.draw.circle(pantalla, (255, 55, 55), (r.right - 3, r.bottom - 5), 2)
-        else:
-            ventana = pygame.Rect(r.x + 4, r.y + r.height * 0.30, r.width - 8, r.height * 0.38)
-            pygame.draw.rect(pantalla, (28, 43, 54), ventana, border_radius=4)
-            if self.orientacion == "ABAJO":
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.left + 5, r.bottom - 4), 2)
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.right - 5, r.bottom - 4), 2)
-            else:
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.left + 5, r.top + 4), 2)
-                pygame.draw.circle(pantalla, (255, 244, 190), (r.right - 5, r.top + 4), 2)
+    def dibujar_sombra(self, lienzo):
+        _, sombra = sprite_coche(self.color, self._grados())
+        lienzo.blit(sombra, sombra.get_rect(center=(self.x + 3, self.y + 5)))
 
-        # Luces direccionales intermitentes
-        if not self.ha_girado and self.intencion != "FRENTE" and int(self.tick * 3.5) % 2 == 0:
-            if self.orientacion == "DERECHA":
-                p = (r.right - 5, r.bottom - 4) if self.intencion == "DERECHA" else (r.right - 5, r.top + 4)
-            elif self.orientacion == "IZQUIERDA":
-                p = (r.left + 5, r.top + 4) if self.intencion == "DERECHA" else (r.left + 5, r.bottom - 4)
-            elif self.orientacion == "ABAJO":
-                p = (r.right - 4, r.bottom - 6) if self.intencion == "DERECHA" else (r.left + 4, r.bottom - 6)
-            else:
-                p = (r.left + 4, r.top + 6) if self.intencion == "DERECHA" else (r.right - 4, r.top + 6)
-            pygame.draw.circle(pantalla, AMARILLO, p, 3)
+    def dibujar(self, lienzo):
+        cuerpo, _ = sprite_coche(self.color, self._grados())
+        lienzo.blit(cuerpo, cuerpo.get_rect(center=(self.x, self.y)))
+
+        rvx, rvy = -self.hy, self.hx   # lado derecho del conductor
+
+        def mundo(f, lado):
+            return (self.x + self.hx * f + rvx * lado, self.y + self.hy * f + rvy * lado)
+
+        if self.frenando:
+            for lado in (-1, 1):
+                pygame.draw.circle(lienzo, (255, 60, 60), mundo(-(LARGO / 2 - 3), lado * (ANCHO / 2 - 4)), 3)
+
+        r = self.ruta
+        if self.giro != "FRENTE" and r.s_linea - 170 <= self.s <= r.s_salida - 10 \
+                and int(self.tick * 3.5) % 2 == 0:
+            lado = 1 if self.giro == "DERECHA" else -1
+            for f in (LARGO / 2 - 4, -(LARGO / 2 - 4)):
+                p = mundo(f, lado * (ANCHO / 2 - 3))
+                pygame.draw.circle(lienzo, (130, 95, 20), p, 5)
+                pygame.draw.circle(lienzo, AMARILLO, p, 3)
 
 
 # ──────────────────────────────────────────────
-# Controlador del Simulador
+# Controlador del simulador
 # ──────────────────────────────────────────────
+ESCALAS_TIEMPO = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
+
+
 class Simulador:
     def __init__(self):
         self.semaforo = Semaforo()
@@ -344,141 +519,211 @@ class Simulador:
         self.ejecutando = True
         self.pausado = False
         self.generacion = 0.0
-        self.intervalo_generacion = 1.3
+        self.intervalo = 1.1
         self.fps_mostrados = 0
-        self._reiniciar_trafico()
+        self.pasados = 0
+        self.idx_escala = ESCALAS_TIEMPO.index(1.0)
+        self.mostrar_rutas = False
+        self.mostrar_estelas = True
+        self._fondo = self._construir_fondo()
+        self._overlay_rutas = self._construir_overlay_rutas()
+        self._panel_hud = pygame.Surface((ANCHO_VIRTUAL, 44), pygame.SRCALPHA)
+        self._panel_hud.fill((13, 17, 20, 215))
+        self._escalado = None
+        self._reiniciar()
 
-    def _reiniciar_trafico(self):
+    # --- estado ------------------------------------------------------------
+    def _reiniciar(self):
         self.vehiculos.clear()
-        for origen in ("DERECHA", "IZQUIERDA", "ABAJO", "ARRIBA"):
+        self.semaforo = Semaforo()
+        self.pasados = 0
+        self.generacion = 0.0
+        for origen in ORIGENES:
             for i in range(3):
-                v = Vehiculo(origen)
-                if origen == "DERECHA":
-                    v.rect.left = -i * 100 - 50
-                elif origen == "IZQUIERDA":
-                    v.rect.left = ANCHO_VIRTUAL + i * 100
-                elif origen == "ABAJO":
-                    v.rect.top = -i * 100 - 50
-                else:
-                    v.rect.top = ALTO_VIRTUAL + i * 100
-                self.vehiculos.append(v)
+                self.vehiculos.append(Vehiculo(origen, s=60 + i * 95 + random.uniform(0, 12)))
 
     def _crear_vehiculo(self, origen):
+        if len(self.vehiculos) >= 70:
+            return
         for v in self.vehiculos:
-            if v.origen != origen or v.ha_girado:
-                continue
-            if origen == "DERECHA" and v.rect.left < 75:
-                return
-            if origen == "IZQUIERDA" and v.rect.right > ANCHO_VIRTUAL - 75:
-                return
-            if origen == "ABAJO" and v.rect.top < 75:
-                return
-            if origen == "ARRIBA" and v.rect.bottom > ALTO_VIRTUAL - 75:
+            if v.origen == origen and v.s < 95:
                 return
         self.vehiculos.append(Vehiculo(origen))
-
-    def dibujar_mapa(self, lienzo):
-        lienzo.fill(GRAMA)
-        for x in range(20, ANCHO_VIRTUAL, 90):
-            for y in range(18, ALTO_VIRTUAL, 85):
-                pygame.draw.circle(lienzo, (38, 64, 52), (x + (y % 17), y), 2)
-
-        # Estructura de calles
-        pygame.draw.rect(lienzo, BORDE, (0, Y_ARRIBA - 4, ANCHO_VIRTUAL, ANCHO_CALLE + 8))
-        pygame.draw.rect(lienzo, BORDE, (X_IZQ - 4, 0, ANCHO_CALLE + 8, ALTO_VIRTUAL))
-        pygame.draw.rect(lienzo, CALLE, (0, Y_ARRIBA, ANCHO_VIRTUAL, ANCHO_CALLE))
-        pygame.draw.rect(lienzo, CALLE, (X_IZQ, 0, ANCHO_CALLE, ALTO_VIRTUAL))
-
-        # Líneas divisorias
-        for x in range(0, ANCHO_VIRTUAL, 38):
-            if not X_IZQ - 5 <= x <= X_DER:
-                pygame.draw.line(lienzo, LINEA, (x, CENTRO_Y), (x + 20, CENTRO_Y), 2)
-        for y in range(0, ALTO_VIRTUAL, 38):
-            if not Y_ARRIBA - 5 <= y <= Y_ABAJO:
-                pygame.draw.line(lienzo, LINEA, (CENTRO_X, y), (CENTRO_X, y + 20), 2)
-
-        pygame.draw.line(lienzo, (90, 94, 98), (0, CENTRO_Y - 1), (X_IZQ, CENTRO_Y - 1), 1)
-        pygame.draw.line(lienzo, (90, 94, 98), (X_DER, CENTRO_Y + 1), (ANCHO_VIRTUAL, CENTRO_Y + 1), 1)
-        pygame.draw.line(lienzo, (90, 94, 98), (CENTRO_X - 1, 0), (CENTRO_X - 1, Y_ARRIBA), 1)
-        pygame.draw.line(lienzo, (90, 94, 98), (CENTRO_X + 1, Y_ABAJO), (CENTRO_X + 1, ALTO_VIRTUAL), 1)
-
-        # Pasos peatonales
-        for i in range(7):
-            xx = X_IZQ + 8 + i * 23
-            pygame.draw.rect(lienzo, (185, 187, 182), (xx, Y_ARRIBA - 19, 13, 13))
-            pygame.draw.rect(lienzo, (185, 187, 182), (xx, Y_ABAJO + 6, 13, 13))
-            yy = Y_ARRIBA + 8 + i * 23
-            pygame.draw.rect(lienzo, (185, 187, 182), (X_IZQ - 19, yy, 13, 13))
-            pygame.draw.rect(lienzo, (185, 187, 182), (X_DER + 6, yy, 13, 13))
-
-    def dibujar_hud(self, lienzo):
-        panel = pygame.Surface((ANCHO_VIRTUAL, 44), pygame.SRCALPHA)
-        panel.fill((13, 17, 20, 215))
-        lienzo.blit(panel, (0, 0))
-        estado = "PAUSADO" if self.pausado else "EN MARCHA"
-        color_estado = AMARILLO if self.pausado else VERDE
-        lienzo.blit(FUENTE_TITULO.render("TRÁFICO URBANO", True, BLANCO), (16, 9))
-        lienzo.blit(FUENTE.render(f"Vehículos: {len(self.vehiculos)}", True, BLANCO), (235, 12))
-        lienzo.blit(FUENTE.render(f"FPS: {self.fps_mostrados}", True,
-                    VERDE if self.fps_mostrados >= 55 else AMARILLO), (385, 12))
-        lienzo.blit(FUENTE.render(f"Semáforo: {self.semaforo.estado.replace('_', ' ')}", True, BLANCO), (485, 12))
-        lienzo.blit(FUENTE.render(estado, True, color_estado), (790, 12))
-        ayuda = "ESPACIO: pausar  |  R: reiniciar tráfico  |  ESC: salir"
-        lienzo.blit(FUENTE_PEQUENA.render(ayuda, True, (225, 228, 220)), (16, ALTO_VIRTUAL - 25))
 
     def actualizar(self, dt):
         self.semaforo.actualizar(dt)
         self.generacion += dt
-        if self.generacion >= self.intervalo_generacion:
+        if self.generacion >= self.intervalo:
             self.generacion = 0.0
-            self._crear_vehiculo(random.choice(("DERECHA", "IZQUIERDA", "ABAJO", "ARRIBA")))
-
-        for v in sorted(self.vehiculos, key=lambda x: (x.orientacion, x.rect.x, x.rect.y)):
-            v.actualizar(dt, self.semaforo, self.vehiculos)
-
+            self._crear_vehiculo(random.choice(ORIGENES))
+        for v in self.vehiculos:
+            v.actualizar(dt, self)
         self.vehiculos = [v for v in self.vehiculos if not v.fuera_pantalla()]
+
+    # --- dibujo estático ---------------------------------------------------
+    def _construir_fondo(self):
+        f = pygame.Surface((ANCHO_VIRTUAL, ALTO_VIRTUAL))
+        f.fill(GRAMA)
+        for x in range(20, ANCHO_VIRTUAL, 90):
+            for y in range(18, ALTO_VIRTUAL, 85):
+                pygame.draw.circle(f, (38, 64, 52), (x + (y % 17), y), 2)
+
+        pygame.draw.rect(f, BORDE, (0, Y_ARRIBA - 4, ANCHO_VIRTUAL, ANCHO_CALLE + 8))
+        pygame.draw.rect(f, BORDE, (X_IZQ - 4, 0, ANCHO_CALLE + 8, ALTO_VIRTUAL))
+        pygame.draw.rect(f, CALLE, (0, Y_ARRIBA, ANCHO_VIRTUAL, ANCHO_CALLE))
+        pygame.draw.rect(f, CALLE, (X_IZQ, 0, ANCHO_CALLE, ALTO_VIRTUAL))
+
+        for x in range(0, ANCHO_VIRTUAL, 38):
+            if not X_IZQ - 5 <= x <= X_DER:
+                pygame.draw.line(f, LINEA, (x, CENTRO_Y), (x + 20, CENTRO_Y), 2)
+        for y in range(0, ALTO_VIRTUAL, 38):
+            if not Y_ARRIBA - 5 <= y <= Y_ABAJO:
+                pygame.draw.line(f, LINEA, (CENTRO_X, y), (CENTRO_X, y + 20), 2)
+
+        # Pasos peatonales
+        cebra = (185, 187, 182)
+        for i in range(7):
+            xx = X_IZQ + 8 + i * 23
+            pygame.draw.rect(f, cebra, (xx, Y_ARRIBA - 19, 13, 13))
+            pygame.draw.rect(f, cebra, (xx, Y_ABAJO + 6, 13, 13))
+            yy = Y_ARRIBA + 8 + i * 23
+            pygame.draw.rect(f, cebra, (X_IZQ - 19, yy, 13, 13))
+            pygame.draw.rect(f, cebra, (X_DER + 6, yy, 13, 13))
+
+        # Líneas de alto (una por aproximación, en su mitad de calzada)
+        pygame.draw.rect(f, BLANCO, (X_IZQ - DIST_PARADA, CENTRO_Y + 3, 4, MITAD - 3))
+        pygame.draw.rect(f, BLANCO, (X_DER + DIST_PARADA - 4, Y_ARRIBA, 4, MITAD - 3))
+        pygame.draw.rect(f, BLANCO, (X_IZQ, Y_ARRIBA - DIST_PARADA, MITAD - 3, 4))
+        pygame.draw.rect(f, BLANCO, (CENTRO_X + 3, Y_ABAJO + DIST_PARADA - 4, MITAD - 3, 4))
+        return f
+
+    def _construir_overlay_rutas(self):
+        ov = pygame.Surface((ANCHO_VIRTUAL, ALTO_VIRTUAL), pygame.SRCALPHA)
+        for r in RUTAS.values():
+            pts, s = [], r.s_linea - 35
+            while s <= r.s_salida + 35:
+                pts.append(r.punto(s))
+                s += 5
+            pygame.draw.lines(ov, COLOR_GIRO[r.giro] + (140,), False, pts, 2)
+        return ov
+
+    # --- HUD ---------------------------------------------------------------
+    def dibujar_hud(self, lienzo):
+        lienzo.blit(self._panel_hud, (0, 0))
+        detenidos = sum(1 for v in self.vehiculos if v.vel < 3)
+        estado = "PAUSADO" if self.pausado else "EN MARCHA"
+        x = 16
+        t = FUENTE_TITULO.render("TRÁFICO URBANO", True, BLANCO)
+        lienzo.blit(t, (x, 9))
+        x += t.get_width() + 24
+        items = [
+            (f"Vehículos {len(self.vehiculos)}", BLANCO),
+            (f"Cruzaron {self.pasados}", BLANCO),
+            (f"Detenidos {detenidos}", AMARILLO if detenidos > 6 else BLANCO),
+            (self.semaforo.texto(), self.semaforo_color()),
+            (f"Vel x{ESCALAS_TIEMPO[self.idx_escala]:g}", BLANCO),
+            (estado, AMARILLO if self.pausado else VERDE),
+        ]
+        for texto, color in items:
+            s = FUENTE.render(texto, True, color)
+            lienzo.blit(s, (x, 12))
+            x += s.get_width() + 18
+
+        ayuda = ("ESPACIO pausa  |  R reiniciar  |  T trayectorias  |  E estelas  |  "
+                 "↑/↓ tráfico  |  +/- velocidad  |  F11 pantalla completa  |  ESC salir")
+        lienzo.blit(FUENTE_PEQUENA.render(ayuda, True, (225, 228, 220)), (16, ALTO_VIRTUAL - 25))
+        fps = FUENTE_PEQUENA.render(f"FPS {self.fps_mostrados}", True, VERDE if self.fps_mostrados >= 55 else AMARILLO)
+        lienzo.blit(fps, (ANCHO_VIRTUAL - fps.get_width() - 14, ALTO_VIRTUAL - 25))
+
+    def semaforo_color(self):
+        e = self.semaforo.estado
+        if e.endswith("VERDE"):
+            return VERDE
+        if e.endswith("AMARILLO"):
+            return AMARILLO
+        return ROJO
+
+    # --- render completo ---------------------------------------------------
+    def renderizar(self, lienzo):
+        lienzo.blit(self._fondo, (0, 0))
+        if self.mostrar_rutas:
+            lienzo.blit(self._overlay_rutas, (0, 0))
+        if self.mostrar_estelas:
+            for v in self.vehiculos:
+                n = len(v.estela)
+                if n < 2:
+                    continue
+                pts = list(v.estela)
+                for i in range(1, n):
+                    k = i / n
+                    col = tuple(int(CALLE[j] + (v.color[j] - CALLE[j]) * k * 0.9) for j in range(3))
+                    pygame.draw.line(lienzo, col, pts[i - 1], pts[i], 3)
+        for v in self.vehiculos:
+            v.dibujar_sombra(lienzo)
+        for v in self.vehiculos:
+            v.dibujar(lienzo)
+        self.semaforo.dibujar(lienzo)
+        self.dibujar_hud(lienzo)
+
+    def presentar(self):
+        ancho_win, alto_win = PANTALLA_REAL.get_size()
+        escala = min(ancho_win / ANCHO_VIRTUAL, alto_win / ALTO_VIRTUAL)
+        w, h = max(1, int(ANCHO_VIRTUAL * escala)), max(1, int(ALTO_VIRTUAL * escala))
+        PANTALLA_REAL.fill((10, 12, 14))
+        if (w, h) == (ANCHO_VIRTUAL, ALTO_VIRTUAL):
+            PANTALLA_REAL.blit(CANVAS_VIRTUAL, ((ancho_win - w) // 2, (alto_win - h) // 2))
+        else:
+            if self._escalado is None or self._escalado.get_size() != (w, h):
+                self._escalado = pygame.Surface((w, h))
+            pygame.transform.smoothscale(CANVAS_VIRTUAL, (w, h), self._escalado)
+            PANTALLA_REAL.blit(self._escalado, ((ancho_win - w) // 2, (alto_win - h) // 2))
+        pygame.display.flip()
+
+    # --- entrada -----------------------------------------------------------
+    def _tecla(self, k):
+        if k == pygame.K_ESCAPE:
+            self.ejecutando = False
+        elif k == pygame.K_SPACE:
+            self.pausado = not self.pausado
+        elif k == pygame.K_r:
+            self._reiniciar()
+        elif k == pygame.K_t:
+            self.mostrar_rutas = not self.mostrar_rutas
+        elif k == pygame.K_e:
+            self.mostrar_estelas = not self.mostrar_estelas
+        elif k == pygame.K_UP:
+            self.intervalo = max(0.35, self.intervalo - 0.15)
+        elif k == pygame.K_DOWN:
+            self.intervalo = min(3.0, self.intervalo + 0.15)
+        elif k in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+            self.idx_escala = min(len(ESCALAS_TIEMPO) - 1, self.idx_escala + 1)
+        elif k in (pygame.K_MINUS, pygame.K_KP_MINUS):
+            self.idx_escala = max(0, self.idx_escala - 1)
+        elif k == pygame.K_F11:
+            try:
+                pygame.display.toggle_fullscreen()
+            except pygame.error:
+                pass
 
     def ejecutar(self):
         while self.ejecutando:
-            dt = min(RELOJ.tick(FPS_OBJETIVO) / 1000.0, 0.033)
+            dt_real = min(RELOJ.tick(FPS_OBJETIVO) / 1000.0, 0.05)
             self.fps_mostrados = int(RELOJ.get_fps())
 
             for evento in pygame.event.get():
                 if evento.type == pygame.QUIT:
                     self.ejecutando = False
                 elif evento.type == pygame.KEYDOWN:
-                    if evento.key == pygame.K_ESCAPE:
-                        self.ejecutando = False
-                    elif evento.key == pygame.K_SPACE:
-                        self.pausado = not self.pausado
-                    elif evento.key == pygame.K_r:
-                        self._reiniciar_trafico()
+                    self._tecla(evento.key)
 
             if not self.pausado:
-                self.actualizar(dt)
+                dt = dt_real * ESCALAS_TIEMPO[self.idx_escala]
+                pasos = max(1, math.ceil(dt / (1 / 90)))
+                for _ in range(pasos):
+                    self.actualizar(dt / pasos)
 
-            # 1. Dibujar el contenido en el lienzo virtual
-            self.dibujar_mapa(CANVAS_VIRTUAL)
-            self.semaforo.dibujar(CANVAS_VIRTUAL)
-            for vehiculo in self.vehiculos:
-                vehiculo.dibujar(CANVAS_VIRTUAL)
-            self.dibujar_hud(CANVAS_VIRTUAL)
-
-            # 2. Reescalado responsivo conservando el aspecto proporcional
-            ancho_win, alto_win = PANTALLA_REAL.get_size()
-            escala = min(ancho_win / ANCHO_VIRTUAL, alto_win / ALTO_VIRTUAL)
-            ancho_escalado = int(ANCHO_VIRTUAL * escala)
-            alto_escalado = int(ALTO_VIRTUAL * escala)
-
-            off_x = (ancho_win - ancho_escalado) // 2
-            off_y = (alto_win - alto_escalado) // 2
-
-            canvas_escalado = pygame.transform.smoothscale(CANVAS_VIRTUAL, (ancho_escalado, alto_escalado))
-
-            PANTALLA_REAL.fill((10, 12, 14))  # Fondo oscuro de relleno para las franjas
-            PANTALLA_REAL.blit(canvas_escalado, (off_x, off_y))
-
-            pygame.display.flip()
+            self.renderizar(CANVAS_VIRTUAL)
+            self.presentar()
 
         pygame.quit()
         sys.exit()
