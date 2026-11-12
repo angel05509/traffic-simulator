@@ -1,4 +1,200 @@
 """
+Simulador de Tráfico - Primera entrega
+======================================
+Una intersección con semáforo, vehículos que avanzan en línea recta y un menú
+para iniciar la simulación o consultar los resultados de corridas anteriores.
+
+Pantallas
+  MENÚ        Iniciar simulación / Ver resultados / Salir (y elegir nivel de tráfico)
+  SIMULACIÓN  ESPACIO pausa | +/- velocidad | ESC cancela y vuelve al menú
+  RESUMEN     Resultados de la corrida que acaba de terminar
+  RESULTADOS  Historial de corridas (se guarda en resultados_simulacion.json)
+
+Requisitos: pip install pygame
+"""
+
+from collections import deque
+from bisect import bisect_right
+import json
+import math
+import os
+import random
+import sys
+from datetime import datetime
+
+import pygame
+
+# ──────────────────────────────────────────────
+# Configuración
+# ──────────────────────────────────────────────
+W, H = 900, 600
+FPS = 60
+CX, CY = W // 2, H // 2
+
+ANCHO_CALLE = 120
+MITAD = ANCHO_CALLE // 2
+CARRIL = 30            # distancia del centro de la calle al centro del carril
+DIST_PARADA = 14       # línea de alto antes del borde de la intersección
+MARGEN = 60            # los coches nacen/mueren fuera de pantalla
+LARGO, ANCHO = 36, 18
+
+X_IZQ, X_DER = CX - MITAD, CX + MITAD
+Y_ARR, Y_ABA = CY - MITAD, CY + MITAD
+
+A_COMODO = 180.0       # desaceleración de planificación (px/s²)
+A_ACEL = 150.0
+A_FRENO = 320.0        # frenado máximo real
+
+DURACION_SIM = 60.0    # segundos simulados por corrida
+ARCHIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resultados_simulacion.json")
+
+# Nivel de tráfico: (nombre, intervalo mín, intervalo máx entre coches de un mismo origen)
+NIVELES = [("Bajo", 4.0, 7.0), ("Medio", 2.5, 4.5), ("Alto", 1.4, 2.6)]
+
+# Colores
+GRAMA = (33, 57, 48)
+CALLE = (53, 57, 62)
+BORDE = (115, 120, 123)
+LINEA = (205, 203, 176)
+BLANCO = (242, 242, 235)
+GRIS = (170, 175, 178)
+AMARILLO = (255, 197, 61)
+ROJO = (255, 75, 75)
+VERDE = (65, 220, 120)
+APAGADO = (62, 65, 67)
+FONDO = (18, 24, 28)
+PANEL = (30, 38, 44)
+ACENTO = (70, 160, 255)
+
+COLORES = [(65, 190, 245), (70, 220, 190), (255, 155, 65), (245, 95, 105),
+           (205, 125, 245), (245, 210, 85), (220, 225, 235), (95, 145, 255)]
+
+# ──────────────────────────────────────────────
+# Orígenes: dirección de avance, punto de nacimiento y línea de alto
+# ──────────────────────────────────────────────
+ORIGENES = ("OESTE", "ESTE", "NORTE", "SUR")
+DIRS = {"OESTE": (1, 0), "ESTE": (-1, 0), "NORTE": (0, 1), "SUR": (0, -1)}
+INICIO = {
+    "OESTE": (-MARGEN, CY + CARRIL),
+    "ESTE": (W + MARGEN, CY - CARRIL),
+    "NORTE": (CX - CARRIL, -MARGEN),
+    "SUR": (CX + CARRIL, H + MARGEN),
+}
+LINEA_ALTO = {
+    "OESTE": (X_IZQ - DIST_PARADA, CY + CARRIL),
+    "ESTE": (X_DER + DIST_PARADA, CY - CARRIL),
+    "NORTE": (CX - CARRIL, Y_ARR - DIST_PARADA),
+    "SUR": (CX + CARRIL, Y_ABA + DIST_PARADA),
+}
+
+
+def _distancia(origen, punto):
+    dx, dy = DIRS[origen]
+    ix, iy = INICIO[origen]
+    return (punto[0] - ix) * dx + (punto[1] - iy) * dy
+
+
+S_LINEA = {o: _distancia(o, LINEA_ALTO[o]) for o in ORIGENES}
+S_FIN = {o: (W if DIRS[o][0] else H) + 2 * MARGEN for o in ORIGENES}
+S_CRUCE = {o: S_LINEA[o] + DIST_PARADA + ANCHO_CALLE for o in ORIGENES}  # fin de la intersección
+
+# ──────────────────────────────────────────────
+# Pygame
+# ──────────────────────────────────────────────
+pygame.init()
+pygame.display.set_caption("Simulador de Tráfico - Primera entrega")
+PANTALLA = pygame.display.set_mode((W, H))
+RELOJ = pygame.time.Clock()
+_FAM = "segoeui,arial,dejavusans,helvetica"
+F_TITULO = pygame.font.SysFont(_FAM, 44, bold=True)
+F_SUB = pygame.font.SysFont(_FAM, 20)
+F_BTN = pygame.font.SysFont(_FAM, 24, bold=True)
+F_TXT = pygame.font.SysFont(_FAM, 18)
+F_PEQ = pygame.font.SysFont(_FAM, 15)
+F_HUD = pygame.font.SysFont(_FAM, 18, bold=True)
+
+
+def texto(superficie, msg, fuente, color, pos, centro=False, derecha=False):
+    img = fuente.render(msg, True, color)
+    r = img.get_rect()
+    if centro:
+        r.center = pos
+    elif derecha:
+        r.topright = pos
+    else:
+        r.topleft = pos
+    superficie.blit(img, r)
+    return r
+
+
+class Boton:
+    def __init__(self, rect, etiqueta, color=ACENTO):
+        self.rect = pygame.Rect(rect)
+        self.etiqueta = etiqueta
+        self.color = color
+
+    def dibujar(self, sup):
+        encima = self.rect.collidepoint(pygame.mouse.get_pos())
+        col = tuple(min(255, c + 35) for c in self.color) if encima else self.color
+        pygame.draw.rect(sup, col, self.rect, border_radius=12)
+        texto(sup, self.etiqueta, F_BTN, (255, 255, 255), self.rect.center, centro=True)
+
+    def clic(self, evento):
+        return evento.type == pygame.MOUSEBUTTONDOWN and evento.button == 1 and self.rect.collidepoint(evento.pos)
+
+
+# ──────────────────────────────────────────────
+# Semáforo (2 fases: H y V, con amarillo y un instante de todo rojo)
+# ──────────────────────────────────────────────
+class Semaforo:
+    ORDEN = ["H_VERDE", "H_AMARILLO", "H_ROJO", "V_VERDE", "V_AMARILLO", "V_ROJO"]
+    DURACION = {"VERDE": 9.0, "AMARILLO": 2.0, "ROJO": 1.5}
+
+    def __init__(self):
+        self.estado = "H_VERDE"
+        self.t = 0.0
+
+    def _dur(self):
+        return self.DURACION[self.estado.split("_")[1]]
+
+    def actualizar(self, dt):
+        self.t += dt
+        while self.t >= self._dur():
+            self.t -= self._dur()
+            self.estado = self.ORDEN[(self.ORDEN.index(self.estado) + 1) % len(self.ORDEN)]
+
+    def luz(self, eje):
+        eje_activo, fase = self.estado.split("_")
+        if eje_activo == eje and fase in ("VERDE", "AMARILLO"):
+            return fase
+        return "ROJO"
+
+    def dibujar(self, sup):
+        cajas = [(X_IZQ - 28, Y_ABA + 6, "H"), (X_DER + 12, Y_ARR - 52, "H"),
+                 (X_IZQ - 28, Y_ARR - 52, "V"), (X_DER + 12, Y_ABA + 6, "V")]
+        cols = {"ROJO": ROJO, "AMARILLO": AMARILLO, "VERDE": VERDE}
+        for x, y, eje in cajas:
+            pygame.draw.rect(sup, (17, 19, 21), (x, y, 18, 46), border_radius=6)
+            activa = self.luz(eje)
+            for i, nombre in enumerate(("ROJO", "AMARILLO", "VERDE")):
+                color = cols[nombre] if activa == nombre else APAGADO
+                pygame.draw.circle(sup, color, (x + 9, y + 9 + i * 14), 5)
+
+
+# ──────────────────────────────────────────────
+# Vehículo (movimiento 1D sobre su carril)
+# ──────────────────────────────────────────────
+class Coche:
+    def __init__(self, origen):
+        self.origen = origen
+        self.dx, self.dy = DIRS[origen]
+        self.eje = "H" if self.dx else "V"
+        self.s = 0.0
+        self.vmax = random.uniform(95, 130)
+        self.vel = self.vmax * 0.7
+        self.color = random.choice(COLORES)
+        self.espera = 0.0
+        self.cruzo = """
 Simulador de Tráfico - Fase 5 (Unificado, Responsivo y con Giros Fluidos)
 =========================================================================
 Fusión de las dos versiones de la Fase 5, con el motor de movimiento rehecho.
@@ -28,13 +224,6 @@ Controles
 Requisitos: pip install pygame
 """
 
-import math
-import random
-import sys
-from bisect import bisect_right
-from collections import deque
-
-import pygame
 
 # ──────────────────────────────────────────────
 # Configuración de lienzo virtual y geometría
@@ -731,3 +920,370 @@ class Simulador:
 
 if __name__ == "__main__":
     Simulador().ejecutar()
+    False
+    self.frenando = False
+
+    @property
+    def x(self):
+        return INICIO[self.origen][0] + self.dx * self.s
+
+    @property
+    def y(self):
+        return INICIO[self.origen][1] + self.dy * self.s
+
+    def actualizar(self, dt, sim):
+        objetivo = self.vmax
+
+        # 1. Semáforo: ¿debo detenerme en la línea de alto?
+        frente = self.s + LARGO / 2
+        d = S_LINEA[self.origen] - frente
+        if d >= 0:
+            luz = sim.semaforo.luz(self.eje)
+            detener = luz == "ROJO" or (luz == "AMARILLO" and self.vel ** 2 / (2 * A_COMODO) <= d)
+            if detener:
+                objetivo = min(objetivo, math.sqrt(2 * A_COMODO * max(d - 2, 0)))
+
+        # 2. Distancia de seguridad con el coche de adelante
+        lider = None
+        for o in sim.coches:
+            if o is not self and o.origen == self.origen and o.s > self.s:
+                if lider is None or o.s < lider.s:
+                    lider = o
+        if lider:
+            gap = lider.s - self.s - LARGO - 6
+            objetivo = min(objetivo, math.sqrt(lider.vel ** 2 + 2 * A_COMODO * max(gap - 4, 0)))
+
+        # 3. Aceleración / frenado progresivos
+        if objetivo < self.vel:
+            self.vel = max(objetivo, self.vel - A_FRENO * dt)
+            self.frenando = True
+        else:
+            self.vel = min(objetivo, self.vel + A_ACEL * dt)
+            self.frenando = False
+
+        self.s += self.vel * dt
+
+        # 4. Estadísticas
+        if not self.cruzo:
+            if self.vel < 5:
+                self.espera += dt
+            if self.s - LARGO / 2 > S_CRUCE[self.origen]:
+                self.cruzo = True
+                sim.registrar_cruce(self)
+
+    def terminado(self):
+        return self.s >= S_FIN[self.origen]
+
+    def dibujar(self, sup):
+        w, h = (LARGO, ANCHO) if self.dx else (ANCHO, LARGO)
+        rect = pygame.Rect(0, 0, w, h)
+        rect.center = (self.x, self.y)
+        sombra = rect.move(2, 3)
+        pygame.draw.rect(sup, (20, 30, 28), sombra, border_radius=6)
+        oscuro = tuple(max(0, c - 50) for c in self.color)
+        pygame.draw.rect(sup, oscuro, rect, border_radius=6)
+        pygame.draw.rect(sup, self.color, rect.inflate(-4, -4), border_radius=5)
+        # parabrisas hacia el frente
+        cab = pygame.Rect(0, 0, w, h)
+        if self.dx:
+            cab.size = (int(LARGO * 0.2), ANCHO - 8)
+            cab.center = (rect.centerx + self.dx * LARGO * 0.18, rect.centery)
+        else:
+            cab.size = (ANCHO - 8, int(LARGO * 0.2))
+            cab.center = (rect.centerx, rect.centery + self.dy * LARGO * 0.18)
+        pygame.draw.rect(sup, (28, 43, 54), cab, border_radius=3)
+        if self.frenando and self.vel < self.vmax - 5:
+            for lado in (-1, 1):
+                if self.dx:
+                    p = (rect.centerx - self.dx * (LARGO / 2 - 2), rect.centery + lado * (ANCHO / 2 - 4))
+                else:
+                    p = (rect.centerx + lado * (ANCHO / 2 - 4), rect.centery - self.dy * (LARGO / 2 - 2))
+                pygame.draw.circle(sup, (255, 60, 60), p, 3)
+
+
+# ──────────────────────────────────────────────
+# Simulación
+# ──────────────────────────────────────────────
+class Simulacion:
+    def __init__(self, nivel):
+        self.nivel = nivel
+        self.nombre_nivel, self.imin, self.imax = NIVELES[nivel]
+        self.semaforo = Semaforo()
+        self.coches = []
+        self.t = 0.0
+        self.pausada = False
+        self.vel_sim = 1
+        self.generados = 0
+        self.cruzaron = 0
+        self.espera_total = 0.0
+        self.cola_max = 0
+        self.temporizadores = {o: random.uniform(0.3, 2.0) for o in ORIGENES}
+        self.terminada = False
+        self.fondo = self._fondo()
+
+    def registrar_cruce(self, coche):
+        self.cruzaron += 1
+        self.espera_total += coche.espera
+
+    def _crear(self, origen):
+        for c in self.coches:
+            if c.origen == origen and c.s < LARGO * 2 + 40:
+                return False
+        self.coches.append(Coche(origen))
+        self.generados += 1
+        return True
+
+    def actualizar(self, dt):
+        self.t += dt
+        self.semaforo.actualizar(dt)
+        for o in ORIGENES:
+            self.temporizadores[o] -= dt
+            if self.temporizadores[o] <= 0:
+                if self._crear(o):
+                    self.temporizadores[o] = random.uniform(self.imin, self.imax)
+                else:
+                    self.temporizadores[o] = 0.3
+        for c in self.coches:
+            c.actualizar(dt, self)
+        self.coches = [c for c in self.coches if not c.terminado()]
+
+        # cola máxima: coches detenidos que aún no cruzan
+        colas = {o: 0 for o in ORIGENES}
+        for c in self.coches:
+            if not c.cruzo and c.vel < 5 and c.s > 0:
+                colas[c.origen] += 1
+        self.cola_max = max(self.cola_max, max(colas.values()))
+
+        if self.t >= DURACION_SIM:
+            self.terminada = True
+
+    def resultados(self):
+        espera_prom = self.espera_total / self.cruzaron if self.cruzaron else 0.0
+        return {
+            "fecha": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "trafico": self.nombre_nivel,
+            "duracion_s": round(self.t, 1),
+            "generados": self.generados,
+            "cruzaron": self.cruzaron,
+            "espera_promedio_s": round(espera_prom, 2),
+            "cola_maxima": self.cola_max,
+            "flujo_veh_min": round(self.cruzaron / (self.t / 60.0), 1) if self.t > 0 else 0.0,
+        }
+
+    def _fondo(self):
+        f = pygame.Surface((W, H))
+        f.fill(GRAMA)
+        pygame.draw.rect(f, BORDE, (0, Y_ARR - 4, W, ANCHO_CALLE + 8))
+        pygame.draw.rect(f, BORDE, (X_IZQ - 4, 0, ANCHO_CALLE + 8, H))
+        pygame.draw.rect(f, CALLE, (0, Y_ARR, W, ANCHO_CALLE))
+        pygame.draw.rect(f, CALLE, (X_IZQ, 0, ANCHO_CALLE, H))
+        for x in range(0, W, 34):
+            if not X_IZQ - 5 <= x <= X_DER:
+                pygame.draw.line(f, LINEA, (x, CY), (x + 18, CY), 2)
+        for y in range(0, H, 34):
+            if not Y_ARR - 5 <= y <= Y_ABA:
+                pygame.draw.line(f, LINEA, (CX, y), (CX, y + 18), 2)
+        # líneas de alto
+        pygame.draw.rect(f, BLANCO, (X_IZQ - DIST_PARADA - 3, CY + 2, 4, MITAD - 2))
+        pygame.draw.rect(f, BLANCO, (X_DER + DIST_PARADA - 1, Y_ARR, 4, MITAD - 2))
+        pygame.draw.rect(f, BLANCO, (X_IZQ, Y_ARR - DIST_PARADA - 3, MITAD - 2, 4))
+        pygame.draw.rect(f, BLANCO, (CX + 2, Y_ABA + DIST_PARADA - 1, MITAD - 2, 4))
+        return f
+
+    def dibujar(self, sup):
+        sup.blit(self.fondo, (0, 0))
+        for c in self.coches:
+            c.dibujar(sup)
+        self.semaforo.dibujar(sup)
+        # HUD
+        barra = pygame.Surface((W, 38), pygame.SRCALPHA)
+        barra.fill((13, 17, 20, 220))
+        sup.blit(barra, (0, 0))
+        restante = max(0, DURACION_SIM - self.t)
+        items = [f"Tráfico: {self.nombre_nivel}", f"Tiempo: {restante:4.1f}s",
+                 f"Generados: {self.generados}", f"Cruzaron: {self.cruzaron}",
+                 f"Cola máx: {self.cola_max}", f"Vel x{self.vel_sim}"]
+        x = 14
+        for it in items:
+            r = texto(sup, it, F_HUD, BLANCO, (x, 9))
+            x = r.right + 22
+        if self.pausada:
+            texto(sup, "PAUSA", F_HUD, AMARILLO, (W - 14, 9), derecha=True)
+        ayuda = "ESPACIO pausa  |  +/- velocidad  |  ESC cancelar y volver al menú"
+        texto(sup, ayuda, F_PEQ, (225, 228, 220), (14, H - 24))
+
+
+# ──────────────────────────────────────────────
+# Historial de resultados (JSON)
+# ──────────────────────────────────────────────
+def cargar_historial():
+    try:
+        with open(ARCHIVO, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        return datos if isinstance(datos, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def guardar_historial(datos):
+    try:
+        with open(ARCHIVO, "w", encoding="utf-8") as f:
+            json.dump(datos, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+# ──────────────────────────────────────────────
+# Pantallas
+# ──────────────────────────────────────────────
+def pantalla_menu(sup, botones, nivel):
+    sup.fill(FONDO)
+    texto(sup, "SIMULADOR DE TRÁFICO", F_TITULO, BLANCO, (W // 2, 110), centro=True)
+    texto(sup, "Intersección con semáforo · Primera entrega", F_SUB, GRIS, (W // 2, 160), centro=True)
+    for b in botones:
+        b.dibujar(sup)
+    texto(sup, "Clic en «Tráfico» para cambiar el nivel", F_PEQ, GRIS, (W // 2, 520), centro=True)
+    texto(sup, f"Duración de cada corrida: {int(DURACION_SIM)} s simulados", F_PEQ, GRIS, (W // 2, 545), centro=True)
+
+
+def pantalla_resumen(sup, res, botones):
+    sup.fill(FONDO)
+    texto(sup, "SIMULACIÓN TERMINADA", F_TITULO, BLANCO, (W // 2, 70), centro=True)
+    pygame.draw.rect(sup, PANEL, (180, 120, 540, 330), border_radius=14)
+    filas = [
+        ("Nivel de tráfico", res["trafico"]),
+        ("Duración simulada", f"{res['duracion_s']} s"),
+        ("Vehículos generados", str(res["generados"])),
+        ("Vehículos que cruzaron", str(res["cruzaron"])),
+        ("Espera promedio", f"{res['espera_promedio_s']} s"),
+        ("Cola máxima (un acceso)", str(res["cola_maxima"])),
+        ("Flujo", f"{res['flujo_veh_min']} veh/min"),
+    ]
+    y = 145
+    for etiqueta, valor in filas:
+        texto(sup, etiqueta, F_SUB, GRIS, (210, y))
+        texto(sup, valor, F_SUB, BLANCO, (690, y), derecha=True)
+        y += 42
+    texto(sup, "Resultado guardado en el historial", F_PEQ, VERDE, (W // 2, 470), centro=True)
+    for b in botones:
+        b.dibujar(sup)
+
+
+def pantalla_historial(sup, historial, botones):
+    sup.fill(FONDO)
+    texto(sup, "RESULTADOS DE SIMULACIONES", F_TITULO, BLANCO, (W // 2, 55), centro=True)
+    pygame.draw.rect(sup, PANEL, (40, 100, 820, 370), border_radius=14)
+    cols = [("#", 60), ("Fecha", 100), ("Tráfico", 245), ("Gener.", 335), ("Cruzaron", 420),
+            ("Espera prom.", 530), ("Cola máx.", 660), ("Veh/min", 760)]
+    for nombre, x in cols:
+        texto(sup, nombre, F_TXT, ACENTO, (x, 112))
+    pygame.draw.line(sup, BORDE, (55, 140), (845, 140), 1)
+
+    if not historial:
+        texto(sup, "Aún no hay simulaciones guardadas.", F_SUB, GRIS, (W // 2, 280), centro=True)
+        texto(sup, "Vuelve al menú y pulsa «Iniciar simulación».", F_TXT, GRIS, (W // 2, 315), centro=True)
+    else:
+        ultimas = historial[-10:]
+        inicio = len(historial) - len(ultimas) + 1
+        y = 150
+        for i, r in enumerate(ultimas):
+            vals = [str(inicio + i), r["fecha"], r["trafico"], str(r["generados"]), str(r["cruzaron"]),
+                    f"{r['espera_promedio_s']} s", str(r["cola_maxima"]), str(r["flujo_veh_min"])]
+            for (_, x), v in zip(cols, vals):
+                texto(sup, v, F_PEQ, BLANCO, (x, y))
+            y += 26
+        prom_cruz = sum(r["cruzaron"] for r in historial) / len(historial)
+        prom_esp = sum(r["espera_promedio_s"] for r in historial) / len(historial)
+        texto(sup, f"Corridas: {len(historial)}   |   Promedio de cruces: {prom_cruz:.1f}   |   "
+              f"Espera promedio global: {prom_esp:.2f} s", F_TXT, VERDE, (W // 2, 440), centro=True)
+    for b in botones:
+        b.dibujar(sup)
+
+
+# ──────────────────────────────────────────────
+# Bucle principal
+# ──────────────────────────────────────────────
+def main():
+    estado = "MENU"
+    nivel = 1
+    sim = None
+    ultimo = None
+    historial = cargar_historial()
+
+    b_iniciar = Boton((300, 220, 300, 56), "Iniciar simulación", (46, 160, 100))
+    b_result = Boton((300, 295, 300, 56), "Ver resultados")
+    b_trafico = Boton((300, 370, 300, 56), "", (120, 100, 200))
+    b_salir = Boton((300, 445, 300, 56), "Salir", (170, 70, 70))
+    b_menu = Boton((250, 500, 190, 52), "Menú", (90, 100, 110))
+    b_repetir = Boton((460, 500, 190, 52), "Repetir", (46, 160, 100))
+    b_volver = Boton((250, 500, 190, 52), "Volver", (90, 100, 110))
+    b_borrar = Boton((460, 500, 190, 52), "Borrar historial", (170, 70, 70))
+
+    while True:
+        dt_real = min(RELOJ.tick(FPS) / 1000.0, 0.05)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+
+            if estado == "MENU":
+                if b_iniciar.clic(ev):
+                    sim, estado = Simulacion(nivel), "SIM"
+                elif b_result.clic(ev):
+                    historial, estado = cargar_historial(), "HISTORIAL"
+                elif b_trafico.clic(ev):
+                    nivel = (nivel + 1) % len(NIVELES)
+                elif b_salir.clic(ev):
+                    pygame.quit()
+                    sys.exit()
+            elif estado == "SIM":
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE:
+                        estado = "MENU"
+                    elif ev.key == pygame.K_SPACE:
+                        sim.pausada = not sim.pausada
+                    elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                        sim.vel_sim = min(4, sim.vel_sim * 2)
+                    elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                        sim.vel_sim = max(1, sim.vel_sim // 2)
+            elif estado == "RESUMEN":
+                if b_menu.clic(ev):
+                    estado = "MENU"
+                elif b_repetir.clic(ev):
+                    sim, estado = Simulacion(nivel), "SIM"
+            elif estado == "HISTORIAL":
+                if b_volver.clic(ev):
+                    estado = "MENU"
+                elif b_borrar.clic(ev):
+                    historial = []
+                    guardar_historial(historial)
+
+        if estado == "SIM" and not sim.pausada:
+            dt = dt_real * sim.vel_sim
+            pasos = max(1, math.ceil(dt / (1 / 60)))
+            for _ in range(pasos):
+                sim.actualizar(dt / pasos)
+                if sim.terminada:
+                    break
+            if sim.terminada:
+                ultimo = sim.resultados()
+                historial = cargar_historial()
+                historial.append(ultimo)
+                guardar_historial(historial)
+                estado = "RESUMEN"
+
+        if estado == "MENU":
+            b_trafico.etiqueta = f"Tráfico: {NIVELES[nivel][0]}"
+            pantalla_menu(PANTALLA, [b_iniciar, b_result, b_trafico, b_salir], nivel)
+        elif estado == "SIM":
+            sim.dibujar(PANTALLA)
+        elif estado == "RESUMEN":
+            pantalla_resumen(PANTALLA, ultimo, [b_menu, b_repetir])
+        elif estado == "HISTORIAL":
+            pantalla_historial(PANTALLA, historial, [b_volver, b_borrar])
+
+        pygame.display.flip()
+
+
+if __name__ == "__main__":
+    main()
